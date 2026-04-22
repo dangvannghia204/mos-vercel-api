@@ -54,7 +54,7 @@ async def submit_exam(payload: dict):
         db.reference(f"submissions/{record_id}").set(payload)
         
         # 2. Ghi vào Lịch sử vĩnh viễn cho Client xem
-        db.reference(f"auth/{safe_user}/history/{record_id}").set(payload)
+        # db.reference(f"auth/{safe_user}/history/{record_id}").set(payload)
         
         return {"status": "success", "message": "Nộp bài thành công!"}
     except Exception as e:
