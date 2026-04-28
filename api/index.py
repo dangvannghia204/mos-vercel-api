@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import credentials, db
@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import os
 import json
+import urllib.request
 
 app = FastAPI()
 
@@ -17,9 +18,10 @@ firebase_cert_json = os.environ.get("FIREBASE_CERT_JSON")
 
 if not firebase_admin._apps:
     try:
-        cert_dict = json.loads(firebase_cert_json)
-        cred = credentials.Certificate(cert_dict)
-        firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_URL})
+        if firebase_cert_json:
+            cert_dict = json.loads(firebase_cert_json)
+            cred = credentials.Certificate(cert_dict)
+            firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_URL})
     except Exception as e:
         print(f"Lỗi khởi tạo Firebase: {e}")
 
@@ -74,7 +76,39 @@ async def record_code_usage(payload: CodeUsagePayload):
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+# --- API 3: VERCEL EDGE CACHE PROXY CHO HÌNH ẢNH ---
+@app.get("/api/image")
+async def proxy_image(url: str):
+    """
+    Biến Vercel thành máy chủ trung gian (CDN Cache).
+    Tải ảnh 1 lần từ Github và lưu đệm 1 năm để phục vụ hàng ngàn sinh viên.
+    """
+    if not url or not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="URL không hợp lệ")
+        
+    try:
+        # Hỗ trợ tự động chuyển đổi link github blob sang raw
+        if "github.com" in url and "/blob/" in url:
+            url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+
+        # Khởi tạo Request giả lập trình duyệt để chống bị chặn
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            img_data = response.read()
+            content_type = response.headers.get('Content-Type', 'image/jpeg')
+
+        # ĐIỂM CỐT LÕI: Kích hoạt Vercel Edge Cache
+        # s-maxage=31536000: Yêu cầu máy chủ CDN của Vercel lưu trữ ảnh này 1 NĂM (không tốn thêm request lên Github)
+        headers = {
+            "Cache-Control": "public, s-maxage=31536000, stale-while-revalidate=86400"
+        }
+        
+        return Response(content=img_data, media_type=content_type, headers=headers)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Không thể tải ảnh từ Server gốc: {str(e)}")
+
 @app.get("/")
 async def root():
     return {"message": "Server Backend thi MOS đang hoạt động bình thường! 🚀"}
