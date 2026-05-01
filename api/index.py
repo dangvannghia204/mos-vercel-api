@@ -17,6 +17,9 @@ SALT = os.environ.get("SALT")
 FIREBASE_URL = os.environ.get("FIREBASE_URL")
 firebase_cert_json = os.environ.get("FIREBASE_CERT_JSON")
 
+if not ENCRYPT_KEY or not SALT:
+    raise ValueError("LỖI NGHIÊM TRỌNG: Chưa cấu hình biến môi trường ENCRYPT_KEY và SALT trên Server!")
+    
 if not firebase_admin._apps:
     try:
         if firebase_cert_json:
