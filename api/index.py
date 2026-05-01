@@ -12,8 +12,8 @@ import urllib.request
 app = FastAPI()
 
 # --- CẤU HÌNH BIẾN MÔI TRƯỜNG ---
-ENCRYPT_KEY = os.environ.get("ENCRYPT_KEY", "Gmetrix@2026")
-SALT = os.environ.get("SALT", "Gmetrix@2026_SecureSalt!#")
+ENCRYPT_KEY = os.environ.get("ENCRYPT_KEY")
+SALT = os.environ.get("SALT")
 FIREBASE_URL = os.environ.get("FIREBASE_URL")
 firebase_cert_json = os.environ.get("FIREBASE_CERT_JSON")
 
