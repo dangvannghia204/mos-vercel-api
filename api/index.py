@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import credentials, db
@@ -77,11 +78,11 @@ async def record_code_usage(payload: CodeUsagePayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- API 3: VERCEL EDGE CACHE PROXY CHO HÌNH ẢNH ---
+# --- API 3: CACHE PROXY CHO HÌNH ẢNH ---
 @app.get("/api/image")
 async def proxy_image(url: str):
     """
-    Biến Vercel thành máy chủ trung gian (CDN Cache).
+    Biến máy chủ thành trung gian (CDN Cache).
     Tải ảnh 1 lần từ Github và lưu đệm 1 năm để phục vụ hàng ngàn sinh viên.
     """
     if not url or not url.startswith("http"):
@@ -98,8 +99,8 @@ async def proxy_image(url: str):
             img_data = response.read()
             content_type = response.headers.get('Content-Type', 'image/jpeg')
 
-        # ĐIỂM CỐT LÕI: Kích hoạt Vercel Edge Cache
-        # s-maxage=31536000: Yêu cầu máy chủ CDN của Vercel lưu trữ ảnh này 1 NĂM (không tốn thêm request lên Github)
+        # ĐIỂM CỐT LÕI: Kích hoạt Cache
+        # s-maxage=31536000: Yêu cầu máy chủ CDN lưu trữ ảnh này 1 NĂM (không tốn thêm request lên Github)
         headers = {
             "Cache-Control": "public, s-maxage=31536000, stale-while-revalidate=86400"
         }
@@ -109,6 +110,46 @@ async def proxy_image(url: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Không thể tải ảnh từ Server gốc: {str(e)}")
 
+# --- API 4: CACHE PROXY CHO FILE ZIP LỚN (MOS WORD/EXCEL) ---
+@app.get("/api/download")
+async def proxy_download(url: str):
+    """
+    Proxy tải file .zip lớn. Sử dụng StreamingResponse để không làm tràn RAM.
+    Kết hợp Header Cache-Control để CDN (Cloudflare/Render) lưu bộ đệm.
+    """
+    if not url or not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="URL không hợp lệ")
+        
+    try:
+        # Hỗ trợ tự động chuyển đổi link github
+        if "github.com" in url and "/blob/" in url:
+            url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+        if "github.com" in url and "/raw/" in url:
+            url = url.replace("github.com", "raw.githubusercontent.com").replace("/raw/refs/heads/", "/").replace("/raw/", "/")
+
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        response = urllib.request.urlopen(req, timeout=30)
+
+        # Trình tạo tải file (Generator) - Đọc từng mảng 8KB truyền đi liên tục
+        def iterfile():
+            with response:
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    yield chunk
+
+        # Thiết lập Cache 30 ngày (2592000 giây) trên CDN cho file ZIP đề thi
+        headers = {
+            "Cache-Control": "public, s-maxage=2592000, stale-while-revalidate=86400",
+            "Content-Disposition": 'attachment; filename="mos_exam_data.zip"'
+        }
+        
+        return StreamingResponse(iterfile(), media_type="application/zip", headers=headers)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Không thể tải file từ Server gốc: {str(e)}")
+
 @app.get("/")
 async def root():
     return {"message": "Server Backend thi MOS đang hoạt động bình thường! 🚀"}
@@ -117,4 +158,3 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
