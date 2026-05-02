@@ -8,6 +8,7 @@ import hashlib
 import os
 import json
 import urllib.request
+import time
 
 app = FastAPI()
 
@@ -29,7 +30,7 @@ if not firebase_admin._apps:
     except Exception as e:
         print(f"Lỗi khởi tạo Firebase: {e}")
 
-# --- HÀM XÁC THỰC ---
+# --- HÀM XÁC THỰC DÙNG CHO CHẤM ĐIỂM ---
 def verify_signature(user: str, score: int, max_score: int, client_sig: str) -> bool:
     raw_data = f"{user}|{score}|{max_score}|{SALT}"
     expected_sig = hmac.new(
@@ -52,8 +53,6 @@ async def submit_exam(payload: dict):
         raise HTTPException(status_code=403, detail="Chữ ký không hợp lệ!")
     
     try:
-        #payload.pop("signature", None) # Xóa chữ ký trước khi lưu
-        
         safe_user = hashlib.sha256(user.encode('utf-8')).hexdigest()[:20]
         
         # 1. Ghi vào Hàng đợi (Queue) cho GAS kéo về và xóa
@@ -81,29 +80,43 @@ async def record_code_usage(payload: CodeUsagePayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- API 3: CACHE PROXY CHO HÌNH ẢNH ---
+# --- API 3: CACHE PROXY CHO HÌNH ẢNH (ĐÃ CÁCH LY CHỐNG SPAM) ---
 @app.get("/api/image")
-async def proxy_image(url: str):
+async def proxy_image(url: str, t: int = 0, sig: str = ""):
     """
-    Biến máy chủ thành trung gian (CDN Cache).
-    Tải ảnh 1 lần từ Github và lưu đệm 1 năm để phục vụ hàng ngàn sinh viên.
+    Máy chủ trung gian tải ảnh có bảo vệ bằng chữ ký và thời gian.
+    Ngăn chặn làm proxy lậu và chống cạn kiệt băng thông ảnh.
     """
     if not url or not url.startswith("http"):
         raise HTTPException(status_code=400, detail="URL không hợp lệ")
+
+    # 1. BẢO VỆ THỜI GIAN: Link ảnh sống trong 2 tiếng (7200 giây) để sv làm bài thi
+    current_time = int(time.time())
+    if current_time - t > 7200 or t > current_time + 60:
+        raise HTTPException(status_code=403, detail="Link ảnh đã hết hạn truy cập.")
+
+    # 2. KIỂM TRA CHỮ KÝ HMAC
+    raw_sig_data = f"image|{t}|{url}|{SALT}"
+    expected_sig = hmac.new(
+        key=ENCRYPT_KEY.encode('utf-8'),
+        msg=raw_sig_data.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(expected_sig, sig):
+        raise HTTPException(status_code=403, detail="Chữ ký không hợp lệ! Truy cập bị từ chối.")
         
+    # 3. XỬ LÝ CACHE VÀ PHẢN HỒI
     try:
         # Hỗ trợ tự động chuyển đổi link github blob sang raw
         if "github.com" in url and "/blob/" in url:
             url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
 
-        # Khởi tạo Request giả lập trình duyệt để chống bị chặn
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=10) as response:
             img_data = response.read()
             content_type = response.headers.get('Content-Type', 'image/jpeg')
 
-        # ĐIỂM CỐT LÕI: Kích hoạt Cache
-        # s-maxage=31536000: Yêu cầu máy chủ CDN lưu trữ ảnh này 1 NĂM (không tốn thêm request lên Github)
         headers = {
             "Cache-Control": "public, s-maxage=31536000, stale-while-revalidate=86400"
         }
@@ -113,18 +126,35 @@ async def proxy_image(url: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Không thể tải ảnh từ Server gốc: {str(e)}")
 
-# --- API 4: CACHE PROXY CHO FILE ZIP LỚN (MOS WORD/EXCEL) ---
+# --- API 4: CACHE PROXY CHO FILE ZIP LỚN (ĐÃ CÁCH LY CHỐNG SPAM) ---
 @app.get("/api/download")
-async def proxy_download(url: str):
+async def proxy_download(url: str, t: int = 0, sig: str = ""):
     """
-    Proxy tải file .zip lớn. Sử dụng StreamingResponse để không làm tràn RAM.
-    Kết hợp Header Cache-Control để CDN (Cloudflare/Render) lưu bộ đệm.
+    Proxy tải file lớn tích hợp chữ ký thời gian (Time-based HMAC).
+    Bảo vệ 100GB Băng thông hàng tháng của hệ thống Serverless.
     """
     if not url or not url.startswith("http"):
         raise HTTPException(status_code=400, detail="URL không hợp lệ")
-        
+    
+    # 1. BẢO VỆ CHỐNG SPAM (REPLAY ATTACK)
+    # Giới hạn link chỉ sống tối đa 5 phút (300 giây) kể từ lúc phần mềm tạo ra
+    current_time = int(time.time())
+    if current_time - t > 300 or t > current_time + 60:
+        raise HTTPException(status_code=403, detail="Link tải đã hết hạn! Chống Spam kích hoạt.")
+
+    # 2. XÁC THỰC CHỮ KÝ ĐIỆN TỬ
+    raw_sig_data = f"download|{t}|{url}|{SALT}"
+    expected_sig = hmac.new(
+        key=ENCRYPT_KEY.encode('utf-8'),
+        msg=raw_sig_data.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(expected_sig, sig):
+        raise HTTPException(status_code=403, detail="Truy cập bị từ chối! Chữ ký không hợp lệ.")
+
+    # 3. STREAM FILE QUA CDN NẾU XÁC THỰC THÀNH CÔNG
     try:
-        # Hỗ trợ tự động chuyển đổi link github
         if "github.com" in url and "/blob/" in url:
             url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
         if "github.com" in url and "/raw/" in url:
@@ -133,7 +163,6 @@ async def proxy_download(url: str):
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         response = urllib.request.urlopen(req, timeout=30)
 
-        # Trình tạo tải file (Generator) - Đọc từng mảng 8KB truyền đi liên tục
         def iterfile():
             with response:
                 while True:
@@ -142,7 +171,7 @@ async def proxy_download(url: str):
                         break
                     yield chunk
 
-        # Thiết lập Cache 30 ngày (2592000 giây) trên CDN cho file ZIP đề thi
+        # Lưu Cache đề thi lên Edge Node 30 ngày (2592000 giây)
         headers = {
             "Cache-Control": "public, s-maxage=2592000, stale-while-revalidate=86400",
             "Content-Disposition": 'attachment; filename="mos_exam_data.zip"'
@@ -157,7 +186,6 @@ async def proxy_download(url: str):
 async def root():
     return {"message": "Server Backend thi MOS đang hoạt động bình thường! 🚀"}
     
-# Khởi động app nội bộ (Render sẽ dùng uvicorn để chạy tự động)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
