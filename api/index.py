@@ -1,5 +1,4 @@
-from fastapi import FastAPI, HTTPException, Response
-
+from fastapi import FastAPI, HTTPException, Response, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import firebase_admin
@@ -9,6 +8,7 @@ import hashlib
 import os
 import json
 import urllib.request
+import urllib.error
 import time
 
 app = FastAPI()
@@ -55,13 +55,8 @@ async def submit_exam(payload: dict):
     
     try:
         safe_user = hashlib.sha256(user.encode('utf-8')).hexdigest()[:20]
-        
-        # 1. Ghi vào Hàng đợi (Queue) cho GAS kéo về và xóa
         db.reference(f"submissions/{record_id}").set(payload)
-        
-        # 2. Ghi vào Lịch sử vĩnh viễn cho Client xem
         db.reference(f"user_history/{safe_user}/{record_id}").set(payload)
-        
         return {"status": "success", "message": "Nộp bài thành công!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi Server: {str(e)}")
@@ -81,22 +76,16 @@ async def record_code_usage(payload: CodeUsagePayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- API 3: CACHE PROXY CHO HÌNH ẢNH (ĐÃ CÁCH LY CHỐNG SPAM) ---
+# --- API 3: CACHE PROXY CHO HÌNH ẢNH (BẢO VỆ HMAC CHỐNG SPAM) ---
 @app.get("/api/image")
 async def proxy_image(url: str, t: int = 0, sig: str = ""):
-    """
-    Máy chủ trung gian tải ảnh có bảo vệ bằng chữ ký và thời gian.
-    Ngăn chặn làm proxy lậu và chống cạn kiệt băng thông ảnh.
-    """
     if not url or not url.startswith("http"):
         raise HTTPException(status_code=400, detail="URL không hợp lệ")
 
-    # 1. BẢO VỆ THỜI GIAN: Link ảnh sống trong 2 tiếng (7200 giây) để sv làm bài thi
     current_time = int(time.time())
     if current_time - t > 7200 or t > current_time + 60:
         raise HTTPException(status_code=403, detail="Link ảnh đã hết hạn truy cập.")
 
-    # 2. KIỂM TRA CHỮ KÝ HMAC
     raw_sig_data = f"image|{t}|{url}|{SALT}"
     expected_sig = hmac.new(
         key=ENCRYPT_KEY.encode('utf-8'),
@@ -107,9 +96,8 @@ async def proxy_image(url: str, t: int = 0, sig: str = ""):
     if not hmac.compare_digest(expected_sig, sig):
         raise HTTPException(status_code=403, detail="Chữ ký không hợp lệ! Truy cập bị từ chối.")
         
-    # 3. XỬ LÝ CACHE VÀ PHẢN HỒI
     try:
-        # Hỗ trợ tự động chuyển đổi link github blob sang raw
+        # Xử lý tự động chuyển đổi link GitHub thành link Raw Public
         if "github.com" in url and "/blob/" in url:
             url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
 
@@ -118,14 +106,83 @@ async def proxy_image(url: str, t: int = 0, sig: str = ""):
             img_data = response.read()
             content_type = response.headers.get('Content-Type', 'image/jpeg')
 
+        # Caching ảnh 1 năm trên CDN để giảm tải
+        headers = {"Cache-Control": "public, s-maxage=31536000, stale-while-revalidate=86400"}
+        return Response(content=img_data, media_type=content_type, headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Không thể tải ảnh: {str(e)}")
+
+# --- API 4: CACHE PROXY CHO FILE ZIP LỚN (HỖ TRỢ CHUNKED DOWNLOAD VÀ GITHUB PUBLIC) ---
+@app.get("/api/download")
+async def proxy_download(url: str, t: int = 0, sig: str = "", range: str = Header(None)):
+    """
+    Proxy tải file lớn. 
+    Tiếp nhận Header Range từ Client truyền xuyên suốt lên GitHub để vượt giới hạn Vercel 4.5MB.
+    Dành cho GitHub Public (Không cần Token xác thực).
+    """
+    if not url or not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="URL không hợp lệ")
+    
+    current_time = int(time.time())
+    if current_time - t > 300 or t > current_time + 60:
+        raise HTTPException(status_code=403, detail="Link tải đã hết hạn! Chống Spam kích hoạt.")
+
+    raw_sig_data = f"download|{t}|{url}|{SALT}"
+    expected_sig = hmac.new(
+        key=ENCRYPT_KEY.encode('utf-8'),
+        msg=raw_sig_data.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(expected_sig, sig):
+        raise HTTPException(status_code=403, detail="Truy cập bị từ chối! Chữ ký không hợp lệ.")
+
+    try:
+        # Xử lý chuẩn hóa Link tải GitHub Public
+        if "github.com" in url and "/blob/" in url:
+            url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+        if "github.com" in url and "/raw/" in url:
+            url = url.replace("github.com", "raw.githubusercontent.com").replace("/raw/refs/heads/", "/").replace("/raw/", "/")
+
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        
+        # CHUYỂN TIẾP LỆNH RANGE: Yêu cầu tải từng khúc (chunk) 4MB để không làm tràn RAM của Vercel
+        if range:
+            req.add_header("Range", range)
+            
+        try:
+            response = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as http_err:
+            return Response(content=f"GitHub Error: {http_err.reason}", status_code=http_err.code)
+
+        def iterfile():
+            with response:
+                while True:
+                    chunk = response.read(8192) # Stream 8KB một lần
+                    if not chunk: break
+                    yield chunk
+
+        # Lưu Cache đề thi lên hệ thống CDN 30 ngày (2592000 giây)
         headers = {
-            "Cache-Control": "public, s-maxage=31536000, stale-while-revalidate=86400"
+            "Cache-Control": "public, s-maxage=2592000, stale-while-revalidate=86400",
+            "Content-Disposition": 'attachment; filename="mos_exam_data.zip"'
         }
         
-        return Response(content=img_data, media_type=content_type, headers=headers)
+        # Trả về mã 206 (Partial Content) nếu Client yêu cầu chia nhỏ
+        content_range = response.getheader("Content-Range")
+        if content_range:
+            headers["Content-Range"] = content_range
+            headers["Accept-Ranges"] = "bytes"
+            
+        return StreamingResponse(
+            iterfile(), 
+            media_type="application/zip", 
+            status_code=response.getcode(), 
+            headers=headers
+        )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Không thể tải ảnh từ Server gốc: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Không thể tải file từ Server gốc: {str(e)}")
 
 @app.get("/")
 async def root():
