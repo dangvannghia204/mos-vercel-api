@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Response
+
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import firebase_admin
@@ -125,62 +126,6 @@ async def proxy_image(url: str, t: int = 0, sig: str = ""):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Không thể tải ảnh từ Server gốc: {str(e)}")
-
-# --- API 4: CACHE PROXY CHO FILE ZIP LỚN (ĐÃ CÁCH LY CHỐNG SPAM) ---
-@app.get("/api/download")
-async def proxy_download(url: str, t: int = 0, sig: str = ""):
-    """
-    Proxy tải file lớn tích hợp chữ ký thời gian (Time-based HMAC).
-    Bảo vệ 100GB Băng thông hàng tháng của hệ thống Serverless.
-    """
-    if not url or not url.startswith("http"):
-        raise HTTPException(status_code=400, detail="URL không hợp lệ")
-    
-    # 1. BẢO VỆ CHỐNG SPAM (REPLAY ATTACK)
-    # Giới hạn link chỉ sống tối đa 5 phút (300 giây) kể từ lúc phần mềm tạo ra
-    current_time = int(time.time())
-    if current_time - t > 300 or t > current_time + 60:
-        raise HTTPException(status_code=403, detail="Link tải đã hết hạn! Chống Spam kích hoạt.")
-
-    # 2. XÁC THỰC CHỮ KÝ ĐIỆN TỬ
-    raw_sig_data = f"download|{t}|{url}|{SALT}"
-    expected_sig = hmac.new(
-        key=ENCRYPT_KEY.encode('utf-8'),
-        msg=raw_sig_data.encode('utf-8'),
-        digestmod=hashlib.sha256
-    ).hexdigest()
-    
-    if not hmac.compare_digest(expected_sig, sig):
-        raise HTTPException(status_code=403, detail="Truy cập bị từ chối! Chữ ký không hợp lệ.")
-
-    # 3. STREAM FILE QUA CDN NẾU XÁC THỰC THÀNH CÔNG
-    try:
-        if "github.com" in url and "/blob/" in url:
-            url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-        if "github.com" in url and "/raw/" in url:
-            url = url.replace("github.com", "raw.githubusercontent.com").replace("/raw/refs/heads/", "/").replace("/raw/", "/")
-
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        response = urllib.request.urlopen(req, timeout=30)
-
-        def iterfile():
-            with response:
-                while True:
-                    chunk = response.read(8192)
-                    if not chunk:
-                        break
-                    yield chunk
-
-        # Lưu Cache đề thi lên Edge Node 30 ngày (2592000 giây)
-        headers = {
-            "Cache-Control": "public, s-maxage=2592000, stale-while-revalidate=86400",
-            "Content-Disposition": 'attachment; filename="mos_exam_data.zip"'
-        }
-        
-        return StreamingResponse(iterfile(), media_type="application/zip", headers=headers)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Không thể tải file từ Server gốc: {str(e)}")
 
 @app.get("/")
 async def root():
